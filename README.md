@@ -32,7 +32,73 @@ Tools: `host_metrics`, `service_status`, `journal_summary`. Journal summary is d
 
 ChatGPT custom remote MCP connections require an eligible account/workspace. This stdio server is not directly connectable from a normal ChatGPT Plus chat. For future remote integration, use an authenticated secure tunnel and approved workspace, or build a separately authenticated web interface for ChatGPT Work. Do not expose this server publicly without authentication.
 
-## Next steps
+## IPTV monitoring
+
+- `iptv_stability(days=1, end_at=None)` reads retained IPTV incidents and
+  client delivery episodes. Supported windows are 1, 7 and 30 days.
+  Results include coverage, counts, recovered episode durations and up to
+  20 affected channels and recent events per list. Channels use stable IDs.
+  The gateway's recording state and dropped-event counter apply at query
+  time and reset when the process restarts. An unavailable database is
+  reported separately from zero recorded incidents. The episode reset
+  boundary does not apply to the separate incident journal.
+- `resource_history(days=1, limit=288, end_at=None)` reads the latest samples
+  within the window and reports its peaks and observed revision changes.
+  CPU time and network bytes are cumulative counters. Compare counter deltas
+  between samples and discard resets. A checkout revision can differ from the
+  verified deployment revision. Changes are detected at sample time.
+- `probe_playback()` checks that the public HLS manifest advances and a
+  fresh media segment yields data. It uses one locally configured channel.
+  It can warm a stream, occupy a slot and appear in viewing telemetry. It
+  does not test a TV's decoder. Use a dedicated test channel where possible.
+
+Use the optional UTC Unix `end_at` to compare equal periods before and
+after a deployment. Segment error fractions use recorded segment 404s
+and successful segment requests, excluding manifest errors. Derived rates
+are omitted when sessions cross the window because individual request
+timestamps are not retained. Viewing time is estimated from gateway requests.
+The 30-day incident window is also subject to the IPTV database's incident cap
+and manual clearing.
+
+Monitoring uses fixed paths under `~/Tvtest` and the existing local gateway
+status endpoint on port 8787. The MCP calls accept no filesystem path,
+credentials or URL and expose no raw logs, viewer identifiers or response
+bodies. Retain the deployment account's existing private access to the
+telemetry and profile files.
+
+### Start resource sampling
+
+Install the included user units as the existing VPS account. They assume
+the repository and its virtual environment are in `~/vps-manager`.
+
+    install -d -m 700 ~/.config/systemd/user
+    install -m 644 systemd/vps-manager-sample.{service,timer} ~/.config/systemd/user/
+    systemctl --user daemon-reload
+    systemctl --user enable --now vps-manager-sample.timer
+    systemctl --user start vps-manager-sample.service
+
+The sampler runs every five minutes and retains 30 days in
+`~/.config/vps-manager/monitor-history.sqlite3`. Continuous collection
+requires the user systemd manager to remain active between login sessions.
+Check `loginctl show-user "$USER" -p Linger` and have the server administrator
+enable lingering if needed.
+
+If the VPS already runs cron, use an entry in the deployment account's
+crontab instead of the user timer. Replace the example home directory with
+the real absolute path. Enable exactly one scheduler.
+
+    */5 * * * * /home/ACCOUNT/vps-manager/.venv/bin/python /home/ACCOUNT/vps-manager/monitor_history.py
+
+### Opt into the playback check
+
+Create `~/.config/vps-manager/playback-probe.json` with mode `0600`.
+Set `token` to the selected profile's TV token and `channel_id` to the
+20-character channel ID from that profile's playlist. Store both locally
+on the VPS and leave the file absent until a channel is chosen. The HLS
+check runs only on request, and downloads at most 64 KiB of one segment.
+
+Reconnect the MCP client after updating the manager so it registers the new
+tools.
 
 ## Enable TV operations (optional)
 

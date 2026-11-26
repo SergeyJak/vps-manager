@@ -1,0 +1,10 @@
+[Unit]
+Description=Collect VPS and IPTV resource metrics
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/vps-manager
+ExecStart=%h/vps-manager/.venv/bin/python %h/vps-manager/monitor_history.py
+TimeoutStartSec=45
+UMask=0077
+NoNewPrivileges=true
