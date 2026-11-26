@@ -37,6 +37,17 @@ def iptv_stability(days: int = 1, end_at: int | None = None) -> dict:
     return iptv_monitoring.stability(manager.PROJECT, days, end_at)
 
 @mcp.tool()
+def iptv_incidents(start_at: int | None = None, end_at: int | None = None, kind: str | None = None,
+                   channel_id: str | None = None, limit: int = 50) -> dict:
+    """Read filtered IPTV events with reason codes, stream occupancy and CDN diagnostics.
+
+    Use UTC Unix seconds for (start_at, end_at]. Defaults to the last day, with at most 30 days
+    per query. Optionally filter by event kind or stable channel ID. Returns at most 200 events.
+    """
+    return iptv_monitoring.incidents(manager.PROJECT, start_at=start_at, end_at=end_at,
+                                    kind=kind, channel_id=channel_id, limit=limit)
+
+@mcp.tool()
 def resource_history(days: int = 1, limit: int = 288, end_at: int | None = None) -> dict:
     """Read VPS and IPTV resource samples for 1, 7 or 30 days, with revision changes.
 

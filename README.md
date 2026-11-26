@@ -42,6 +42,15 @@ ChatGPT custom remote MCP connections require an eligible account/workspace. Thi
   time and reset when the process restarts. An unavailable database is
   reported separately from zero recorded incidents. The episode reset
   boundary does not apply to the separate incident journal.
+- `iptv_incidents(start_at=None, end_at=None, kind=None, channel_id=None, limit=50)`
+  reads individual events with sanitized reason codes, stream occupancy,
+  buffer metrics and reserve CDN decisions where recorded. The default window
+  is the last day. Use UTC Unix timestamps for `(start_at, end_at]`, up to
+  30 days per query. Filter by `kind` (for example, `client_error`) or stable
+  `channel_id` (including its cabinet prefix when present). Results are newest
+  first, with the total matching count and a truncation indicator if the
+  requested limit (1–200) was reached and more events match. Older rows may
+  have no diagnostics. The response excludes viewer IDs, tokens and URLs.
 - `resource_history(days=1, limit=288, end_at=None)` reads the latest samples
   within the window and reports its peaks and observed revision changes.
   CPU time and network bytes are cumulative counters. Compare counter deltas

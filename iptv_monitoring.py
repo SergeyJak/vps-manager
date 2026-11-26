@@ -16,6 +16,14 @@ KINDS = ("upstream_error", "segment_slow", "stream_stalled", "stream_recovered",
 SEGMENT_FAILURES = ("HTTP_404_STREAM_EXPIRED", "HTTP_404_SEGMENT_CACHE_MISS")
 CDN_REASONS = ("START", "SOURCE_RESTARTED", "SOURCE_UNAVAILABLE", "PUBLISH_STALL",
                "NO_READY_BACKUP", "SWITCH_COOLDOWN", "HOME_RECOVERED", "SOURCE_AVAILABLE")
+SOURCE_REASON = re.compile(
+    r"(?:MANIFEST|SEGMENT|SOURCE_REFRESH)_(?:HTTP_[1-5][0-9]{2}|NETWORK_ERROR|TIMEOUT|"
+    r"INCOMPLETE_READ|INVALID_HLS|OSError|ConnectionResetError|ConnectionRefusedError|"
+    r"not_hls|unsupported_hls_features|empty_or_oversize_segment|unsupported_segment_scheme|"
+    r"playlist_too_large|missing_variant|too_many_master_playlists|truncated_segment|empty_playlist)"
+)
+BUFFER_STATES = ("READY", "WAITING_FOR_VIDEO", "WARMING_OR_REBUILDING_BUFFER")
+RESERVE_STATES = ("NOT_CONFIGURED", "NO_UNIQUE_CHANNEL_MATCH", "STREAM_LIMIT", "WORKER_STOPPED")
 
 
 class NoRedirect(HTTPRedirectHandler):
@@ -73,6 +81,142 @@ def window(days, end_at=None, *, now=None):
 
 def safe_channel(value):
     return value if isinstance(value, str) and CHANNEL_ID.fullmatch(value) else None
+
+
+def incidents(project, *, start_at=None, end_at=None, kind=None, channel_id=None, limit=50, now=None):
+    """Read a bounded slice of the fixed incident journal without viewer data."""
+    earliest, end = window(30, end_at, now=now)
+    if start_at is None:
+        start, _ = window(1, end, now=end)
+    elif type(start_at) is int and earliest <= start_at < end:
+        start = start_at
+    else:
+        raise ValueError("start_at must be a UTC Unix timestamp within 30 days before end_at")
+    if kind is not None and kind not in KINDS:
+        raise ValueError("Unknown incident kind")
+    if channel_id is not None and safe_channel(channel_id) is None:
+        raise ValueError("Invalid channel_id")
+    if type(limit) is not int or not 1 <= limit <= 200:
+        raise ValueError("limit must be between 1 and 200")
+
+    clauses = ["occurred_at > ?", "occurred_at <= ?"]
+    args = [start, end]
+    if kind is not None:
+        clauses.append("kind = ?")
+        args.append(kind)
+    if channel_id is not None:
+        clauses.append("channel_id = ?")
+        args.append(channel_id)
+    where = " AND ".join(clauses)
+
+    path = project / ".iptv_state/telemetry.sqlite3"
+    report = {"state": "missing", "start_at": start, "end_at": end,
+              "incident_count": None, "truncated": False, "incidents": []}
+    try:
+        with closing(read_only(path)) as db, db:
+            db.execute("BEGIN")
+            cols = {row["name"] for row in db.execute("PRAGMA table_info(incidents)")}
+            if not {"id", "occurred_at", "channel_id", "kind", "detail", "duration_seconds"} <= cols:
+                return dict(report, state="unsupported_schema")
+            snapshot = ("CASE WHEN length(diagnostics) <= 32768 THEN diagnostics END"
+                        if "diagnostics" in cols else "NULL")
+            count = db.execute(f"SELECT COUNT(*) FROM incidents WHERE {where}", args).fetchone()[0]
+            rows = db.execute(f"""SELECT occurred_at, channel_id, kind, detail, duration_seconds,
+                                         {snapshot} AS diagnostics
+                                  FROM incidents WHERE {where}
+                                  ORDER BY occurred_at DESC, id DESC LIMIT ?""", (*args, limit))
+            events = [dict(_incident_event(row), diagnostics=_incident_diagnostics(row["diagnostics"]))
+                      for row in rows]
+    except sqlite3.Error:
+        return dict(report, state="unreadable" if path.exists() else "missing")
+    return dict(report, state="ready", incident_count=count, truncated=count > len(events), incidents=events)
+
+
+def _incident_event(row):
+    return {"occurred_at": row["occurred_at"], "channel_id": safe_channel(row["channel_id"]),
+            "kind": row["kind"] if row["kind"] in KINDS else "other",
+            "reason": _incident_reason(row["detail"]), "duration_seconds": _numeric_metric(row["duration_seconds"])}
+
+
+def _numeric_metric(value):
+    return value if type(value) in (int, float) and 0 <= value < 2**63 else None
+
+
+def _diagnostic_fields(payload, *, numbers=(), flags=(), choices=None):
+    fields = {}
+    for key in numbers:
+        value = _numeric_metric(payload.get(key))
+        if value is not None:
+            fields[key] = value
+    for key in flags:
+        value = payload.get(key)
+        if type(value) is bool:
+            fields[key] = value
+    for key, allowed in (choices or {}).items():
+        value = payload.get(key)
+        if type(value) in (int, str) and value in allowed:
+            fields[key] = value
+    return fields
+
+
+def _add_capacity(payload, fields):
+    fields.update(_diagnostic_fields(payload, numbers=("max_streams",)))
+    active = payload.get("active")
+    if isinstance(active, list):
+        streams = []
+        for stream in active[:8]:
+            if not isinstance(stream, dict):
+                continue
+            row = _diagnostic_fields(stream, flags=("pinned", "standby"),
+                                     numbers=("pending_requests", "idle_seconds"))
+            channel = safe_channel(stream.get("channel_id"))
+            if channel is not None:
+                row["channel_id"] = channel
+            if row:
+                streams.append(row)
+        fields["active"] = streams
+
+
+def _incident_diagnostics(raw):
+    if not isinstance(raw, str):
+        return None
+    try:
+        payload = json.loads(raw)
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    fields = _diagnostic_fields(
+        payload,
+        numbers=("startup_wait_seconds", "publish_age_seconds", "contiguous_tail_segments",
+                 "contiguous_tail_seconds", "effective_buffer_delay_seconds", "last_published_sequence",
+                 "seconds_since_published_advance", "last_downloaded_sequence",
+                 "seconds_since_segment_download", "seconds_since_new_segment"),
+        flags=("tuning_changed",),
+        choices={"route": ("manifest", "segment"), "buffer_state": BUFFER_STATES,
+                 "selected_slot": (1, 2, 3), "from_slot": (1, 2, 3)},
+    )
+    _add_capacity(payload, fields)
+    sources = payload.get("sources")
+    if isinstance(sources, dict):
+        candidate_details = {}
+        for slot in ("1", "2", "3"):
+            candidate = sources.get(slot)
+            if not isinstance(candidate, dict):
+                continue
+            state = _diagnostic_fields(
+                candidate,
+                numbers=("age_seconds", "buffer_seconds", "published_age_seconds", "published_sequence",
+                         "downloaded_sequence", "other_guests"),
+                flags=("ready", "fresh"), choices={"state": RESERVE_STATES},
+            )
+            _add_capacity(candidate, state)
+            if state:
+                candidate_details[slot] = state
+        if candidate_details:
+            fields["sources"] = candidate_details
+    return fields or None
 
 
 def _episodes(db, start, end, tables):
@@ -161,10 +305,7 @@ def stability(project, days=1, end_at=None, *, now=None):
             for row in db.execute(
                 """SELECT occurred_at, channel_id, kind, detail, duration_seconds FROM incidents
                    WHERE occurred_at > ? AND occurred_at <= ? ORDER BY occurred_at DESC, id DESC LIMIT 20""", (start, end)):
-                recent.append({"occurred_at": row["occurred_at"], "channel_id": safe_channel(row["channel_id"]),
-                               "kind": row["kind"] if row["kind"] in KINDS else "other",
-                               "reason": _incident_reason(row["detail"]),
-                               "duration_seconds": row["duration_seconds"]})
+                recent.append(_incident_event(row))
     except sqlite3.Error:
         if path.exists():
             coverage["database"] = "unreadable"
@@ -197,7 +338,8 @@ def _incident_reason(value):
     if not isinstance(value, str):
         return None
     if value in (*SEGMENT_FAILURES, *CDN_REASONS, "HTTP_503_STREAM_LIMIT", "HTTP_503_MANIFEST_WARMUP",
-                 "MANIFEST_WARMUP_TIMEOUT"):
+                 "MANIFEST_WARMUP_TIMEOUT", "SEGMENT_DOWNLOAD_SLOW", "NO_DOWNLOADED_SEGMENTS",
+                 "UPSTREAM_NO_PROGRESS", "UPSTREAM_PROGRESS_RESTORED") or SOURCE_REASON.fullmatch(value):
         return value
     match = re.match(r"(?:HTTP[ _])([1-5][0-9]{2})(?:\b|_)", value)
     return "HTTP_" + match[1] if match else None
