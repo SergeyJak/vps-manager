@@ -30,5 +30,35 @@ class ManagerTests(unittest.TestCase):
             self.assertFalse(manager.service_status("iptv-admin.service")["available"])
             self.assertFalse(manager.journal_summary("iptv-admin.service")["available"])
 
+    def test_restart_rejects_unknown_and_unconfirmed(self):
+        with patch("manager._restart") as restart:
+            with self.assertRaises(ValueError):
+                manager.restart_service("ssh.service", manager.CONFIRM)
+            with self.assertRaises(ValueError):
+                manager.restart_service("iptv-admin.service", "wrong")
+            restart.assert_not_called()
+
+    def test_write_disabled(self):
+        with patch("manager.os.geteuid", return_value=1000), patch("manager.WRITE_FLAG") as flag:
+            flag.is_file.return_value = False
+            with self.assertRaises(PermissionError):
+                manager.deploy_project(manager.CONFIRM)
+
+    def test_failed_tests_do_not_restart(self):
+        from contextlib import nullcontext
+        good = SimpleNamespace(returncode=0)
+        with patch("manager.require_write"), patch("manager.operation_lock", return_value=nullcontext()), \
+             patch("manager.check_checkout"), patch("manager.revision", side_effect=["a"*40, "b"*40]), \
+             patch("manager.git", return_value=good), patch("manager._test", return_value={"ok": False}), \
+             patch("manager._restart") as restart:
+            result = manager.deploy_project(manager.CONFIRM)
+            self.assertEqual(result["stage"], "tests")
+            restart.assert_not_called()
+
+    def test_health_does_not_claim_playback(self):
+        with patch("manager.service_status", return_value={"properties":{"ActiveState":"active"}}), \
+             patch("manager.urllib.request.urlopen", side_effect=OSError):
+            self.assertFalse(manager.health_check()["ok"])
+
 if __name__ == "__main__":
     unittest.main()
