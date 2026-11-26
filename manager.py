@@ -3,6 +3,8 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
+import time
 import fcntl
 import urllib.request
 import urllib.error
@@ -12,10 +14,10 @@ from pathlib import Path
 UNITS = frozenset(("iptv-gateway.service", "iptv-admin.service"))
 ENV = {"PATH": "/usr/bin:/bin", "LANG": "C", "SYSTEMD_PAGER": "cat"}
 
-def run_fixed(args):
+def run_fixed(args, *, timeout=8):
     try:
         result = subprocess.run(args, capture_output=True, text=True,
-                                timeout=8, env=ENV, check=False)
+                                timeout=timeout, env=ENV, check=False)
     except (OSError, subprocess.TimeoutExpired):
         return None
     return result if result.returncode == 0 else None
@@ -37,12 +39,14 @@ def host_metrics():
             "disk_total_bytes": disk.total, "disk_free_bytes": disk.free,
             "uptime_seconds": float(Path("/proc/uptime").read_text().split()[0])}
 
-def service_status(unit):
+def service_status(unit, *, timeout=8):
     validate_unit(unit)
+    if timeout <= 0:
+        return {"available": False, "service": unit}
     properties = ("LoadState", "ActiveState", "SubState", "MainPID", "NRestarts",
                   "MemoryCurrent", "CPUUsageNSec")
     result = run_fixed(["/usr/bin/systemctl", "show", "--no-pager",
-                        "--property=" + ",".join(properties), unit])
+                        "--property=" + ",".join(properties), unit], timeout=timeout)
     if result is None:
         return {"available": False, "service": unit}
     values = {}
@@ -99,7 +103,7 @@ def require_write(confirm):
 
 @contextmanager
 def operation_lock():
-    directory = Path.home() / ".config/vps-manager"
+    directory = WRITE_FLAG.parent
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (directory / "operation.lock").open("a") as lock:
         try:
@@ -142,31 +146,75 @@ def check_checkout():
     if remote.stdout.strip().removesuffix(".git") != REMOTE:
         raise RuntimeError("Unexpected Git remote")
 
-def _test():
+def _test(checkout):
     result = execute(["/usr/bin/python3", "-m", "unittest", "discover",
-                      "-s", "tests", "-v"], PROJECT, timeout=300)
+                      "-s", "tests", "-v"], checkout, timeout=300)
     return {"ok": success(result), "exit_code": result.returncode if result else None}
+
+def _test_revision(target):
+    with tempfile.TemporaryDirectory(prefix="vps-manager-") as directory:
+        checkout = Path(directory) / "checkout"
+        remove = ("worktree", "remove", "--force", str(checkout))
+        if not success(git("worktree", "add", "--detach", str(checkout), target)):
+            if checkout.exists():
+                git(*remove)
+            return {"ok": False, "exit_code": None, "stage": "checkout"}
+        try:
+            result = _test(checkout)
+        finally:
+            removed = success(git(*remove))
+        if not removed:
+            return {"ok": False, "exit_code": result["exit_code"], "stage": "cleanup"}
+        return result
 
 def run_tests():
     # Project test code is executable, so use the same opt-in as other operations.
     require_write(CONFIRM)
     with operation_lock():
         check_checkout()
-        return _test()
+        return _test(PROJECT)
 
-def health_check():
-    statuses = {unit: service_status(unit) for unit in sorted(UNITS)}
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+def _admin_http_status(timeout):
+    if timeout <= 0:
+        return None
+    opener = urllib.request.build_opener(_NoRedirect())
+    try:
+        with opener.open(HEALTH_URL, timeout=timeout) as response:
+            return response.status
+    except urllib.error.HTTPError as error:
+        with error:
+            return error.code
+    except OSError:
+        return None
+
+def _probe_timeout(deadline):
+    return 8 if deadline is None else min(8, deadline - time.monotonic())
+
+def health_check(*, deadline=None):
+    statuses = {unit: service_status(unit, timeout=_probe_timeout(deadline)) for unit in sorted(UNITS)}
     active = all(x.get("properties", {}).get("ActiveState") == "active"
                  for x in statuses.values())
-    http_status = None
-    try:
-        with urllib.request.urlopen(HEALTH_URL, timeout=8) as response:
-            http_status = response.status
-    except (OSError, urllib.error.URLError):
-        pass
+    http_status = _admin_http_status(_probe_timeout(deadline))
     return {"ok": active and http_status == 200, "services": statuses,
             "admin_http_status": http_status,
             "note": "Checks systemd and admin HTTPS, not actual TV playback."}
+
+def _wait_for_health():
+    deadline = time.monotonic() + 30
+    health = health_check(deadline=deadline)
+    while not health["ok"]:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(1, remaining))
+        if time.monotonic() >= deadline:
+            break
+        health = health_check(deadline=deadline)
+    return health
 
 def _restart(units):
     return success(execute(["/usr/bin/sudo", "-n", "/usr/bin/systemctl",
@@ -182,6 +230,18 @@ def restart_service(unit, confirm):
         return {"ok": status.get("properties", {}).get("ActiveState") == "active",
                 "status": status}
 
+def _verified_revision(revision_file):
+    try:
+        return revision_file.read_text(encoding="ascii", errors="replace").strip()
+    except FileNotFoundError:
+        return None
+
+def _record_verified_revision(revision_file, target):
+    with tempfile.TemporaryDirectory(dir=revision_file.parent, prefix="revision-") as directory:
+        pending = Path(directory) / revision_file.name
+        pending.write_text(target + "\n", encoding="ascii")
+        pending.replace(revision_file)
+
 def deploy_project(confirm):
     require_write(confirm)
     with operation_lock():
@@ -192,19 +252,29 @@ def deploy_project(confirm):
         target = revision("FETCH_HEAD")
         if not target or not success(git("merge-base", "--is-ancestor", before, target)):
             return {"ok": False, "stage": "non_fast_forward"}
-        if before == target:
-            return {"ok": True, "changed": False, "revision": before, "health": health_check()}
-        if not success(git("merge", "--ff-only", target)):
-            return {"ok": False, "stage": "merge", "revision": revision()}
-        tests = _test()
+        revision_file = WRITE_FLAG.with_name("verified-revision")
+        changed = before != target
+        if not changed and _verified_revision(revision_file) == target:
+            health = health_check()
+            return {"ok": health["ok"], "changed": False, "revision": target, "health": health}
+        tests = _test_revision(target)
         if not tests["ok"]:
-            # Do not restart services with untested code. Keep the checkout
-            # intact for inspection; never reset or delete production files.
             return {"ok": False, "stage": "tests", "previous": before,
                     "revision": target, "manual_review_required": True, "tests": tests}
+        check_checkout()
+        if revision() != before:
+            return {"ok": False, "stage": "checkout", "previous": before, "revision": target}
+        # A failed or interrupted deployment must be retried even when HEAD matches main.
+        revision_file.unlink(missing_ok=True)
+        if changed and not success(git("merge", "--ff-only", target)):
+            return {"ok": False, "stage": "merge", "revision": revision()}
+        if revision() != target:
+            return {"ok": False, "stage": "checkout", "previous": before, "revision": target}
         if not _restart(sorted(UNITS)):
             return {"ok": False, "stage": "restart", "previous": before,
                     "revision": target, "manual_review_required": True}
-        health = health_check()
-        return {"ok": health["ok"], "stage": "health", "changed": True,
+        health = _wait_for_health()
+        if health["ok"]:
+            _record_verified_revision(revision_file, target)
+        return {"ok": health["ok"], "stage": "health", "changed": changed,
                 "previous": before, "revision": target, "health": health}

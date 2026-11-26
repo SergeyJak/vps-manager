@@ -35,7 +35,7 @@ def restart_service(unit: str, confirm: str) -> dict:
 
 @mcp.tool()
 def deploy_project(confirm: str) -> dict:
-    """Fast-forward TV main, run tests, then restart both services and check health. Obtain user approval first; confirm=CONFIRM_TV_CHANGE."""
+    """Test the target revision, fast-forward TV main, then restart both services and verify health. Obtain user approval first; confirm=CONFIRM_TV_CHANGE."""
     return manager.deploy_project(confirm)
 
 if __name__ == "__main__":

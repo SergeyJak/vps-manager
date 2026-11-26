@@ -1,6 +1,14 @@
+import io
+import subprocess
+import sys
 import unittest
+from contextlib import ExitStack
+from email.message import Message
+from pathlib import Path
+from tempfile import TemporaryDirectory
 from types import SimpleNamespace
 from unittest.mock import patch
+from urllib.response import addinfourl
 import manager
 
 class ManagerTests(unittest.TestCase):
@@ -44,21 +52,162 @@ class ManagerTests(unittest.TestCase):
             with self.assertRaises(PermissionError):
                 manager.deploy_project(manager.CONFIRM)
 
-    def test_failed_tests_do_not_restart(self):
-        from contextlib import nullcontext
-        good = SimpleNamespace(returncode=0)
-        with patch("manager.require_write"), patch("manager.operation_lock", return_value=nullcontext()), \
-             patch("manager.check_checkout"), patch("manager.revision", side_effect=["a"*40, "b"*40]), \
-             patch("manager.git", return_value=good), patch("manager._test", return_value={"ok": False}), \
-             patch("manager._restart") as restart:
-            result = manager.deploy_project(manager.CONFIRM)
-            self.assertEqual(result["stage"], "tests")
-            restart.assert_not_called()
-
     def test_health_does_not_claim_playback(self):
         with patch("manager.service_status", return_value={"properties":{"ActiveState":"active"}}), \
-             patch("manager.urllib.request.urlopen", side_effect=OSError):
-            self.assertFalse(manager.health_check()["ok"])
+             patch("urllib.request.HTTPSHandler.https_open", side_effect=OSError):
+            result = manager.health_check()
+        self.assertFalse(result["ok"])
+        self.assertIsNone(result["admin_http_status"])
+
+    def test_health_preserves_http_error(self):
+        response = self.http_response(manager.HEALTH_URL, 503)
+        with patch("manager.service_status", return_value={"properties": {"ActiveState": "active"}}), \
+             patch("urllib.request.HTTPSHandler.https_open", return_value=response):
+            result = manager.health_check()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["admin_http_status"], 503)
+
+    def test_health_does_not_follow_redirect(self):
+        next_url = manager.HEALTH_URL + "other"
+        headers = Message()
+        headers["Location"] = next_url
+        responses = [self.http_response(manager.HEALTH_URL, 302, headers),
+                     self.http_response(next_url, 200)]
+        with patch("manager.service_status", return_value={"properties": {"ActiveState": "active"}}), \
+             patch("urllib.request.HTTPSHandler.https_open", side_effect=responses) as request:
+            result = manager.health_check()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["admin_http_status"], 302)
+        request.assert_called_once()
+
+    @staticmethod
+    def http_response(url, code, headers=None):
+        response = addinfourl(io.BytesIO(), headers or Message(), url, code)
+        response.msg = "Test response"
+        return response
+
+
+class DeployTests(unittest.TestCase):
+    def setUp(self):
+        resources = ExitStack()
+        self.addCleanup(resources.close)
+        root = Path(resources.enter_context(TemporaryDirectory()))
+        remote = root / "upstream"
+        remote.mkdir()
+        self.project = root / "live"
+        self.git(remote, "init", "-q", "-b", "main")
+        self.before = self.commit(remote, "old")
+        self.git(root, "clone", "-q", remote.as_posix(), str(self.project))
+        (remote / "tests").mkdir()
+        (remote / "tests" / "test_sample.py").write_text(
+            "import unittest\n"
+            "\n"
+            "class AppTests(unittest.TestCase):\n"
+            "    def test_version(self):\n"
+            "        self.fail('fixture intentionally rejects the target')\n",
+            encoding="ascii",
+        )
+        self.git(remote, "add", "tests")
+        self.target = self.commit(remote, "new")
+
+        flag = root / ".config" / "vps-manager" / "enable-writes"
+        flag.parent.mkdir(parents=True)
+        flag.touch()
+        resources.enter_context(patch.multiple(manager, PROJECT=self.project, REMOTE=remote.as_posix(),
+                                                 WRITE_FLAG=flag))
+        resources.enter_context(patch("manager.git", side_effect=lambda *args: self.git(self.project, *args)))
+        resources.enter_context(patch("manager.require_write"))
+
+    @staticmethod
+    def git(cwd, *args):
+        return subprocess.run(["git", *args], cwd=cwd, capture_output=True, text=True, check=True)
+
+    def commit(self, repo, content):
+        (repo / "app.txt").write_text(content, encoding="ascii")
+        self.git(repo, "add", "app.txt")
+        self.git(repo, "-c", "user.name=Deploy Test", "-c", "user.email=test@example.invalid",
+                 "-c", "commit.gpgSign=false", "commit", "-qm", content)
+        return self.git(repo, "rev-parse", "HEAD").stdout.strip()
+
+    def deploy(self):
+        return manager.deploy_project(manager.CONFIRM)
+
+    def test_failed_tests_leave_live_checkout_untouched(self):
+        observed = []
+
+        def execute_python(args, checkout, timeout):
+            observed.append((checkout, (checkout / "app.txt").read_text(), manager.revision()))
+            return subprocess.run([sys.executable, *args[1:]], cwd=checkout, timeout=timeout,
+                                  capture_output=True, text=True, check=False)
+
+        with patch("manager.execute", side_effect=execute_python), patch("manager._restart") as restart:
+            result = self.deploy()
+        self.assertEqual(result["stage"], "tests")
+        self.assertEqual(result["tests"], {"ok": False, "exit_code": 1})
+        self.assertEqual(manager.revision(), self.before)
+        self.assertEqual((self.project / "app.txt").read_text(), "old")
+        checkout, content, live_revision = observed[0]
+        self.assertEqual((content, live_revision), ("new", self.before))
+        self.assertNotEqual(checkout, self.project)
+        self.assertFalse(checkout.exists())
+        self.assertEqual(self.git(self.project, "worktree", "list", "--porcelain").stdout.count("worktree "), 1)
+        restart.assert_not_called()
+
+    def test_retry_after_failed_restart_completes_deploy(self):
+        with patch("manager._test", return_value={"ok": True}) as tests, \
+             patch("manager._restart", side_effect=[False, True]) as restart, \
+             patch("manager.health_check", return_value={"ok": True}):
+            first = self.deploy()
+            second = self.deploy()
+        self.assertEqual(first["stage"], "restart")
+        self.assertEqual(manager.revision(), self.target)
+        self.assertTrue(second["ok"])
+        self.assertEqual(tests.call_count, 2)
+        self.assertEqual(restart.call_count, 2)
+
+    def test_up_to_date_deploy_reports_current_health(self):
+        with patch("manager._test", return_value={"ok": True}) as tests, \
+             patch("manager._restart", return_value=True) as restart, \
+             patch("manager.health_check", side_effect=[{"ok": True}, {"ok": False}]):
+            first = self.deploy()
+            second = self.deploy()
+        self.assertTrue(first["ok"])
+        self.assertFalse(second["ok"])
+        self.assertFalse(second["changed"])
+        tests.assert_called_once()
+        restart.assert_called_once()
+
+    def test_deploy_waits_for_health_after_restart(self):
+        clock = SimpleNamespace(monotonic=lambda: 0, sleep=lambda seconds: None)
+        with patch("manager.time", clock, create=True), \
+             patch("manager._test", return_value={"ok": True}), \
+             patch("manager._restart", return_value=True) as restart, \
+             patch("manager.health_check", side_effect=[{"ok": False}, {"ok": True}]) as health:
+            result = self.deploy()
+        self.assertTrue(result["ok"])
+        self.assertEqual(health.call_count, 2)
+        restart.assert_called_once()
+
+    def test_deploy_stops_waiting_and_can_retry_after_unhealthy_release(self):
+        now = 0
+
+        def sleep(seconds):
+            nonlocal now
+            now += seconds
+
+        clock = SimpleNamespace(monotonic=lambda: now, sleep=sleep)
+        with patch("manager.time", clock, create=True), \
+             patch("manager._test", return_value={"ok": True}), \
+             patch("manager._restart", return_value=True) as restart, \
+             patch("manager.health_check", return_value={"ok": False}) as health:
+            first = self.deploy()
+            self.assertFalse(first["ok"])
+            self.assertEqual(now, 30)
+            self.assertGreater(health.call_count, 1)
+            health.return_value = {"ok": True}
+            second = self.deploy()
+        self.assertTrue(second["ok"])
+        self.assertEqual(restart.call_count, 2)
 
 if __name__ == "__main__":
     unittest.main()
